@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Syntax and unit tests
+        run: |
+          python3 -c "import ast,pathlib; ast.parse(pathlib.Path('bundlearch').read_text())"
+          python3 -m unittest discover -s tests -v
+      - name: CLI smoke
+        run: python3 bundlearch --version

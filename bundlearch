@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Offline, read-only Mach-O architecture header inventory (Python 3.9+)."""
+import argparse
+import json
+import os
+import stat
+import struct
+
+VERSION = "0.1.0"
+CPU = {7: "i386", 12: "arm", 0x01000007: "x86_64", 0x0100000c: "arm64"}
+THIN = {b"\xce\xfa\xed\xfe": ("<", 28), b"\xfe\xed\xfa\xce": (">", 28),
+        b"\xcf\xfa\xed\xfe": ("<", 32), b"\xfe\xed\xfa\xcf": (">", 32)}
+FAT = {b"\xca\xfe\xba\xbe": (">", 20), b"\xbe\xba\xfe\xca": ("<", 20),
+       b"\xca\xfe\xba\xbf": (">", 32), b"\xbf\xba\xfe\xca": ("<", 32)}
+
+
+def read_at(fd, offset, size):
+    data = os.pread(fd, size, offset)
+    if len(data) != size:
+        raise ValueError("truncated_header")
+    return data
+
+
+def thin_cpu(fd, offset, size):
+    magic = read_at(fd, offset, 4)
+    if magic not in THIN:
+        raise ValueError("non_macho_slice")
+    endian, length = THIN[magic]
+    if size < length:
+        raise ValueError("truncated_header")
+    header = read_at(fd, offset, length)
+    return struct.unpack(endian + "I", header[4:8])[0]
+
+
+def architectures(fd, size):
+    if size < 4:
+        return None
+    magic = read_at(fd, 0, 4)
+    if magic in THIN:
+        values = [thin_cpu(fd, 0, size)]
+    elif magic in FAT:
+        endian, width = FAT[magic]
+        count = struct.unpack(endian + "I", read_at(fd, 4, 4))[0]
+        if not 1 <= count <= 64:
+            raise ValueError("ambiguous_or_unsupported_fat_header")
+        table_end = 8 + count * width
+        table = read_at(fd, 8, count * width)
+        values, ranges = [], []
+        for i in range(count):
+            row = table[i * width:(i + 1) * width]
+            fmt = "IIIII" if width == 20 else "IIQQII"
+            cpu, subtype, offset, length, align = struct.unpack(endian + fmt, row)[:5]
+            if offset < table_end or length < 28 or offset + length > size:
+                raise ValueError("invalid_slice_bounds")
+            if align > 63 or offset % (1 << align):
+                raise ValueError("invalid_slice_alignment")
+            if any(offset < end and offset + length > start for start, end in ranges):
+                raise ValueError("overlapping_slices")
+            if thin_cpu(fd, offset, length) != cpu:
+                raise ValueError("slice_cpu_mismatch")
+            ranges.append((offset, offset + length))
+            values.append(cpu)
+    else:
+        return None
+    return sorted({CPU.get(v, "cpu_%08x" % v) for v in values})
+
+
+def scan(root, required, max_entries):
+    report = {"schema_version": 1, "required": required, "macho_files": [],
+              "issues": [], "entries": 0, "ignored_non_macho": 0,
+              "scope": "headers_only_no_symlinks", "status": "UNKNOWN"}
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    stack = []
+    def issue(path, code):
+        report["issues"].append({"path": path, "code": code})
+    try:
+        rootfd = os.open(root, flags | os.O_DIRECTORY)
+        stack.append((rootfd, "", 0))
+        while stack:
+            directory, prefix, depth = stack.pop()
+            try:
+                names = os.listdir(directory)
+                for name in sorted(names):
+                    relative = prefix + name
+                    report["entries"] += 1
+                    if report["entries"] > max_entries:
+                        issue(".", "entry_limit")
+                        return report
+                    try:
+                        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                        if stat.S_ISLNK(info.st_mode):
+                            issue(relative, "symlink_skipped")
+                        elif stat.S_ISDIR(info.st_mode):
+                            if depth >= 64:
+                                issue(relative, "depth_limit")
+                            else:
+                                child = os.open(name, flags | os.O_DIRECTORY, dir_fd=directory)
+                                stack.append((child, relative + "/", depth + 1))
+                        elif stat.S_ISREG(info.st_mode):
+                            fd = os.open(name, flags, dir_fd=directory)
+                            try:
+                                before = os.fstat(fd)
+                                if not stat.S_ISREG(before.st_mode):
+                                    raise ValueError("file_type_changed")
+                                arch = architectures(fd, before.st_size)
+                                after = os.fstat(fd)
+                                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                                    raise ValueError("file_changed")
+                                if arch is None:
+                                    report["ignored_non_macho"] += 1
+                                else:
+                                    report["macho_files"].append({"path": relative, "architectures": arch,
+                                                                 "missing_required": required not in arch})
+                            finally:
+                                os.close(fd)
+                        else:
+                            issue(relative, "special_file_skipped")
+                    except (OSError, ValueError) as exc:
+                        issue(relative, str(exc) if isinstance(exc, ValueError) else "read_error")
+            except OSError:
+                issue(prefix or ".", "directory_read_error")
+            finally:
+                os.close(directory)
+    except OSError:
+        issue(".", "root_read_error")
+    finally:
+        for fd, _, _ in stack:
+            os.close(fd)
+    report["macho_files"].sort(key=lambda row: row["path"])
+    if not report["issues"] and report["macho_files"]:
+        report["status"] = "MISSING" if any(r["missing_required"] for r in report["macho_files"]) else "PRESENT"
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", help="directory or app bundle (root must not be a symlink)")
+    parser.add_argument("--require", required=True, choices=("arm64", "x86_64", "arm", "i386"))
+    parser.add_argument("--max-entries", type=int, default=50000)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args()
+    if not 1 <= args.max_entries <= 1000000:
+        parser.error("--max-entries must be 1..1000000")
+    result = scan(args.root, args.require, args.max_entries)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+    else:
+        print("BundleArch %s: %s (header inventory, not runtime compatibility)" % (VERSION, result["status"]))
+        for row in result["macho_files"]:
+            print("%s %s %s" % ("MISSING" if row["missing_required"] else "PRESENT",
+                                  json.dumps(row["path"], ensure_ascii=True), ",".join(row["architectures"])))
+        for row in result["issues"]:
+            print("UNKNOWN %s %s" % (json.dumps(row["path"], ensure_ascii=True), row["code"]))
+        print("Mach-O files: %d; entries: %d; issues: %d" %
+              (len(result["macho_files"]), result["entries"], len(result["issues"])))
+    return {"PRESENT": 0, "MISSING": 1, "UNKNOWN": 2}[result["status"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
